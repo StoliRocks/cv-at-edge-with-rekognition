@@ -1,0 +1,20 @@
+{
+    "dev": {
+        "awscloudformation": {
+            "AuthRoleName": "amplify-rekognition-snapshot-dev-114205-authRole",
+            "UnauthRoleArn": "arn:aws:iam::661133080262:role/amplify-rekognition-snapshot-dev-114205-unauthRole",
+            "AuthRoleArn": "arn:aws:iam::661133080262:role/amplify-rekognition-snapshot-dev-114205-authRole",
+            "Region": "us-east-1",
+            "DeploymentBucketName": "amplify-rekognition-snapshot-dev-114205-deployment",
+            "UnauthRoleName": "amplify-rekognition-snapshot-dev-114205-unauthRole",
+            "StackName": "amplify-rekognition-snapshot-dev-114205",
+            "StackId": "arn:aws:cloudformation:us-east-1:661133080262:stack/amplify-rekognition-snapshot-dev-114205/4d7be230-5d76-11ea-9830-0ab7c9206afb",
+            "AmplifyAppId": "d2s053a8pgv3gz"
+        },
+        "categories": {
+            "auth": {
+                "rekognitionsnapshot557e7b18": {}
+            }
+        }
+    }
+}

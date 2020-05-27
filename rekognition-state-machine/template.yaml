@@ -1,0 +1,218 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  rekognition-state-machine
+
+  Sample SAM Template for rekognition-state-machine
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 3
+
+Resources:
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+  TrailBucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Retain
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AWSCloudTrailAclCheck
+          Effect: Allow
+          Principal:
+            Service: cloudtrail.amazonaws.com
+          Action: s3:GetBucketAcl
+          Resource: !Sub arn:aws:s3:::${TrailBucket}
+        - Sid: AWSCloudTrailWrite
+          Effect: Allow
+          Principal:
+            Service: cloudtrail.amazonaws.com
+          Action: s3:PutObject
+          Resource: !Sub 'arn:aws:s3:::${TrailBucket}/AWSLogs/${AWS::AccountId}/*'
+          Condition:
+            StringEquals:
+              's3:x-amz-acl': 'bucket-owner-full-control'
+  ImageBucketCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn:
+      - TrailBucketPolicy
+    Properties: 
+      EventSelectors: 
+        - 
+          DataResources: 
+          - 
+            Type: AWS::S3::Object
+            Values: 
+              - !Join [ '', [!GetAtt TrailBucket.Arn, '/']]
+      IsLogging: True
+      S3BucketName: !Ref TrailBucket
+      TrailName: ImageBucketCloudTrail
+  S3BucketEventRule:
+    Type: AWS::Events::Rule
+    Properties: 
+      EventPattern: !Sub |
+        {
+          "source": [
+            "aws.s3"
+          ],
+          "detail-type": [
+            "AWS API Call via CloudTrail"
+          ],
+          "detail": {
+            "eventSource": [
+              "s3.amazonaws.com"
+            ],
+            "eventName": [
+              "PutObject"
+            ],
+            "requestParameters": {
+              "bucketName": [
+                "${ImageBucket}"
+              ]
+            }
+          }
+        }
+      Targets: 
+        -
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          Arn: !Ref RekognitionStateMachine
+          Id: RekognitionStateMachineTarget
+  DetectLabelsFunction:
+    Type: AWS::Serverless::Function 
+    Properties:
+      CodeUri: detect_labels/
+      Handler: app.lambda_handler
+      Runtime: python3.7
+      Environment:
+          Variables:
+              S3_BUCKET: !Ref ImageBucket
+      Policies:
+          - AWSLambdaExecute # Managed Policy
+          - Version: '2012-10-17' # Policy Document
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rekognition:DetectLabels
+                Resource: '*'
+  PublishToTopicFunction:
+    Type: AWS::Serverless::Function 
+    Properties:
+      CodeUri: publish_to_topic/
+      Handler: app.lambda_handler
+      Runtime: python3.7
+      Policies:
+          - AWSLambdaExecute # Managed Policy
+          - AWSIoTDataAccess # Managed Policy
+  UpdateShadowFunction:
+    Type: AWS::Serverless::Function 
+    Properties:
+      CodeUri: update_shadow/
+      Handler: app.lambda_handler
+      Runtime: python3.7
+      Policies:
+          - AWSLambdaExecute # Managed Policy
+          - AWSIoTDataAccess # Managed Policy
+  GeneratePresignedUrlFunction:
+    Type: AWS::Serverless::Function 
+    Properties:
+      CodeUri: generate_presigned_url/
+      Handler: app.lambda_handler
+      Runtime: python3.7
+      Policies:
+          - AWSLambdaExecute # Managed Policy
+          - AmazonS3FullAccess # Managed Policy
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties : 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Effect: "Allow"
+            Principal: 
+              Service: 
+                - "events.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+  ProcessImageRole:
+    Type: AWS::IAM::Role
+    Properties : 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - 
+            Effect: "Allow"
+            Principal: 
+              Service: 
+                - "states.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Policies:
+        - 
+          PolicyName: !Sub '${AWS::StackName}-lambda'
+          PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                  - 
+                    Effect: Allow
+                    Action:
+                        - lambda:InvokeFunction
+                    Resource:
+                        - !GetAtt DetectLabelsFunction.Arn
+                        - !GetAtt PublishToTopicFunction.Arn
+                        - !GetAtt GeneratePresignedUrlFunction.Arn
+  RekognitionStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties: 
+      DefinitionString: !Sub |
+        {
+          "Comment": "An example of the Amazon States Language using a choice state.",
+          "StartAt": "DetectLabels",
+          "States": {
+            "DetectLabels": {
+              "Type": "Task",
+              "Resource": "${DetectLabelsFunction.Arn}",
+              "ResultPath": "$",
+              "Next": "GeneratePresignedUrl"
+            },
+
+            "GeneratePresignedUrl": {
+              "Type": "Task",
+              "Resource": "${GeneratePresignedUrlFunction.Arn}",
+              "ResultPath": "$.GeneratePresignedUrl",
+              "Next": "PublishToTopic"
+            },
+
+            "PublishToTopic": {
+              "Type": "Task",
+              "Resource": "${PublishToTopicFunction.Arn}",
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt ProcessImageRole.Arn
+      StateMachineName: RekognitionStateMachine
+
+Outputs:
+  DetectLabelsFunction:
+    Description: "Detect Labels Lambda Function ARN"
+    Value: !GetAtt DetectLabelsFunction.Arn
+  PublishToTopicFunction:
+    Description: "Publish To Topic Lambda Function ARN"
+    Value: !GetAtt PublishToTopicFunction.Arn
+  GeneratePresignedUrlFunction:
+    Description: "Generate Presigned Url Lambda Function ARN"
+    Value: !GetAtt GeneratePresignedUrlFunction.Arn
+  UpdateShadowFunction:
+    Description: "Update Shadow Lambda Function ARN"
+    Value: !GetAtt UpdateShadowFunction.Arn
+    

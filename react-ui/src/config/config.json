@@ -1,0 +1,5 @@
+{
+    "region": "us-east-1",
+    "wss_endpoint": "wss://apmbknwhgmqhj-ats.iot.us-east-1.amazonaws.com/mqtt",
+    "iot_policy_name": "rekognition-snapshot-policy"
+}
