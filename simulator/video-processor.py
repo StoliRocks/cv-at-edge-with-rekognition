@@ -7,18 +7,18 @@ import time
 bucketName = 'loves-rekognition-imagebucket-d08f31xbuk00'
 keyPrefix = 'loves-video-frame-'
 # Playing video from file:
-cap = cv2.VideoCapture('speedco.mp4')
+cap = cv2.VideoCapture('local.mp4')
 s3 = boto3.resource('s3')
 
 
 def update_shadow(payload):
 
-    client = boto3.client('iot-data', region_name='us-east-1')
+    client = boto3.client('iot-data', region_name='us-east-2')
 
     data = json.dumps(payload)
 
     response = client.publish(
-        topic='$aws/things/Garage1/shadow/update',
+        topic='$aws/things/rek_at_edge_Core/shadow/update',
         payload=data
     )
 
