@@ -1,0 +1,154 @@
+# Docker Compose for Jetson Edge CV Application
+# Requires NVIDIA Container Runtime for GPU support
+
+version: "3.8"
+
+services:
+  # Main edge application
+  edge-cv:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: final
+    image: jetson-edge-cv:latest
+    container_name: edge-cv
+    restart: unless-stopped
+
+    # NVIDIA runtime for GPU access
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
+      # Application settings (override in .env file)
+      - EDGE_APP_NAME=${EDGE_APP_NAME:-jetson-edge-cv}
+      - EDGE_DEBUG=${EDGE_DEBUG:-false}
+
+      # Video settings
+      - EDGE_VIDEO__SOURCE=${EDGE_VIDEO_SOURCE:-0}
+      - EDGE_VIDEO__SOURCE_TYPE=${EDGE_VIDEO_SOURCE_TYPE:-auto}
+      - EDGE_VIDEO__WIDTH=${EDGE_VIDEO_WIDTH:-1280}
+      - EDGE_VIDEO__HEIGHT=${EDGE_VIDEO_HEIGHT:-720}
+      - EDGE_VIDEO__FPS=${EDGE_VIDEO_FPS:-30}
+
+      # Inference settings
+      - EDGE_INFERENCE__MODEL_PATH=${EDGE_MODEL_PATH:-/app/models/yolov8n.onnx}
+      - EDGE_INFERENCE__BACKEND=${EDGE_INFERENCE_BACKEND:-auto}
+      - EDGE_INFERENCE__DEVICE=${EDGE_INFERENCE_DEVICE:-cuda:0}
+      - EDGE_INFERENCE__CONFIDENCE_THRESHOLD=${EDGE_CONFIDENCE_THRESHOLD:-0.5}
+
+      # AWS settings
+      - EDGE_AWS__REGION=${AWS_REGION:-us-east-1}
+      - EDGE_AWS__IOT_ENDPOINT=${AWS_IOT_ENDPOINT:-}
+      - EDGE_AWS__IOT_THING_NAME=${AWS_IOT_THING_NAME:-JetsonEdgeDevice}
+      - EDGE_AWS__IOT_TOPIC=${AWS_IOT_TOPIC:-garage/001/bay/01}
+      - EDGE_AWS__S3_BUCKET=${AWS_S3_BUCKET:-}
+
+      # Output settings
+      - EDGE_OUTPUT__ENABLE_DISPLAY=${EDGE_ENABLE_DISPLAY:-false}
+      - EDGE_OUTPUT__ENABLE_RTSP=${EDGE_ENABLE_RTSP:-false}
+
+    volumes:
+      # Model files
+      - ./models:/app/models:ro
+      # AWS certificates
+      - ./certs:/app/certs:ro
+      # Configuration
+      - ./config:/app/config:ro
+      # Output (videos, logs)
+      - ./output:/app/output:rw
+      # Video device access
+      - /dev/video0:/dev/video0
+
+    devices:
+      # Video devices
+      - /dev/video0:/dev/video0
+
+    # Network configuration
+    network_mode: host
+    # Alternative: use bridge with port mapping
+    # ports:
+    #   - "8554:8554"  # RTSP
+    #   - "8080:8080"  # HTTP API
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute]
+
+    # Logging configuration
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Optional: Local MQTT broker for testing
+  mqtt-broker:
+    image: eclipse-mosquitto:2
+    container_name: mqtt-broker
+    restart: unless-stopped
+    profiles:
+      - local-mqtt
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./config/mosquitto:/mosquitto/config:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+
+  # Optional: Monitoring with Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    profiles:
+      - monitoring
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  # Optional: Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    profiles:
+      - monitoring
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+
+volumes:
+  mosquitto-data:
+  mosquitto-log:
+  prometheus-data:
+  grafana-data:
+
+# Networks (only needed if not using host network)
+networks:
+  edge-network:
+    driver: bridge

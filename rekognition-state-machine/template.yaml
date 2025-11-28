@@ -1,22 +1,144 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: >
-  rekognition-state-machine
+  CV at Edge with Rekognition - Serverless Backend
 
-  Sample SAM Template for rekognition-state-machine
+  This stack provides the cloud backend for the Jetson Edge CV application.
+  Supports both cloud-based Rekognition inference (fallback) and edge inference results.
 
-# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+  IoTThingName:
+    Type: String
+    Default: JetsonEdgeDevice
+    Description: Name of the IoT thing for edge device
+
+  IoTTopic:
+    Type: String
+    Default: garage/001/bay/01
+    Description: Base MQTT topic for publishing detection results
+
+  RetentionDays:
+    Type: Number
+    Default: 30
+    Description: Days to retain CloudWatch logs
+
+  EnableXRay:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable AWS X-Ray tracing
+
+# =============================================================================
+# Globals
+# =============================================================================
 Globals:
   Function:
-    Timeout: 3
+    Timeout: 30
+    MemorySize: 256
+    Runtime: python3.12
+    Architectures:
+      - arm64  # Use ARM64 for cost optimization
+    Tracing: !If [EnableXRayCondition, Active, PassThrough]
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        IOT_THING_NAME: !Ref IoTThingName
+        IOT_TOPIC: !Ref IoTTopic
+        LOG_LEVEL: !If [IsProd, INFO, DEBUG]
+    Tags:
+      Project: cv-at-edge
+      Environment: !Ref Environment
 
+# =============================================================================
+# Conditions
+# =============================================================================
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+  EnableXRayCondition: !Equals [!Ref EnableXRay, 'true']
+
+# =============================================================================
+# Resources
+# =============================================================================
 Resources:
+  # ---------------------------------------------------------------------------
+  # S3 Buckets
+  # ---------------------------------------------------------------------------
   ImageBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-images-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldFrames
+            Status: Enabled
+            ExpirationInDays: !Ref RetentionDays
+            Prefix: frames/
+      VersioningConfiguration:
+        Status: Suspended
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - '*'
+            AllowedMethods:
+              - GET
+            AllowedHeaders:
+              - '*'
+            MaxAge: 3600
+      Tags:
+        - Key: Project
+          Value: cv-at-edge
+        - Key: Environment
+          Value: !Ref Environment
+
   TrailBucket:
-    Type: 'AWS::S3::Bucket'
+    Type: AWS::S3::Bucket
     DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-trail-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 7
+      Tags:
+        - Key: Project
+          Value: cv-at-edge
+
   TrailBucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
@@ -24,195 +146,395 @@ Resources:
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
-        - Sid: AWSCloudTrailAclCheck
-          Effect: Allow
-          Principal:
-            Service: cloudtrail.amazonaws.com
-          Action: s3:GetBucketAcl
-          Resource: !Sub arn:aws:s3:::${TrailBucket}
-        - Sid: AWSCloudTrailWrite
-          Effect: Allow
-          Principal:
-            Service: cloudtrail.amazonaws.com
-          Action: s3:PutObject
-          Resource: !Sub 'arn:aws:s3:::${TrailBucket}/AWSLogs/${AWS::AccountId}/*'
-          Condition:
-            StringEquals:
-              's3:x-amz-acl': 'bucket-owner-full-control'
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub 'arn:aws:s3:::${TrailBucket}'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/ImageBucketCloudTrail'
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub 'arn:aws:s3:::${TrailBucket}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+                'AWS:SourceArn': !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/ImageBucketCloudTrail'
+
+  # ---------------------------------------------------------------------------
+  # CloudTrail
+  # ---------------------------------------------------------------------------
   ImageBucketCloudTrail:
     Type: AWS::CloudTrail::Trail
     DependsOn:
       - TrailBucketPolicy
-    Properties: 
-      EventSelectors: 
-        - 
-          DataResources: 
-          - 
-            Type: AWS::S3::Object
-            Values: 
-              - !Join [ '', [!GetAtt TrailBucket.Arn, '/']]
-      IsLogging: True
-      S3BucketName: !Ref TrailBucket
+    Properties:
       TrailName: ImageBucketCloudTrail
+      IsLogging: true
+      S3BucketName: !Ref TrailBucket
+      EventSelectors:
+        - DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub '${ImageBucket.Arn}/'
+          ReadWriteType: WriteOnly
+          IncludeManagementEvents: false
+      Tags:
+        - Key: Project
+          Value: cv-at-edge
+
+  # ---------------------------------------------------------------------------
+  # EventBridge Rule
+  # ---------------------------------------------------------------------------
   S3BucketEventRule:
     Type: AWS::Events::Rule
-    Properties: 
-      EventPattern: !Sub |
-        {
-          "source": [
-            "aws.s3"
-          ],
-          "detail-type": [
-            "AWS API Call via CloudTrail"
-          ],
-          "detail": {
-            "eventSource": [
-              "s3.amazonaws.com"
-            ],
-            "eventName": [
-              "PutObject"
-            ],
-            "requestParameters": {
-              "bucketName": [
-                "${ImageBucket}"
-              ]
-            }
-          }
-        }
-      Targets: 
-        -
-          RoleArn: !GetAtt EventBridgeRole.Arn
-          Arn: !Ref RekognitionStateMachine
-          Id: RekognitionStateMachineTarget
-  DetectLabelsFunction:
-    Type: AWS::Serverless::Function 
     Properties:
+      Name: !Sub '${AWS::StackName}-s3-event-rule'
+      Description: Trigger Step Functions on S3 image upload
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - PutObject
+          requestParameters:
+            bucketName:
+              - !Ref ImageBucket
+      Targets:
+        - Id: RekognitionStateMachineTarget
+          Arn: !Ref RekognitionStateMachine
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  # ---------------------------------------------------------------------------
+  # Lambda Functions
+  # ---------------------------------------------------------------------------
+  DetectLabelsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-detect-labels'
+      Description: Detect objects in images using Rekognition
       CodeUri: detect_labels/
       Handler: app.lambda_handler
-      Runtime: python3.7
+      Timeout: 30
+      MemorySize: 512
       Environment:
-          Variables:
-              S3_BUCKET: !Ref ImageBucket
+        Variables:
+          S3_BUCKET: !Ref ImageBucket
+          CONFIDENCE_THRESHOLD: '50'
+          TARGET_LABELS: 'Truck,Car,Vehicle'
+          ROI_X1: '0.10'
+          ROI_Y1: '0.10'
+          ROI_X2: '0.85'
+          ROI_Y2: '0.90'
       Policies:
-          - AWSLambdaExecute # Managed Policy
-          - Version: '2012-10-17' # Policy Document
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - rekognition:DetectLabels
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub '${ImageBucket.Arn}/*'
+
+  PublishToTopicFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-publish-to-topic'
+      Description: Publish detection results to IoT topic
+      CodeUri: publish_to_topic/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          IOT_TOPIC: !Ref IoTTopic
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - iot:Publish
+              Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${IoTTopic}'
+            - Effect: Allow
+              Action:
+                - iot:Publish
+              Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${IoTTopic}/*'
+
+  UpdateShadowFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-update-shadow'
+      Description: Update IoT device shadow with detection state
+      CodeUri: update_shadow/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          IOT_THING_NAME: !Ref IoTThingName
+          LOGS_TOPIC: !Sub '${IoTTopic}/logs'
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - iot:GetThingShadow
+                - iot:UpdateThingShadow
+              Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:thing/${IoTThingName}'
+            - Effect: Allow
+              Action:
+                - iot:Publish
+              Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${IoTTopic}/logs'
+
+  GeneratePresignedUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-generate-presigned-url'
+      Description: Generate presigned URL for S3 image access
+      CodeUri: generate_presigned_url/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          URL_EXPIRATION: '3600'
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub '${ImageBucket.Arn}/*'
+
+  # ---------------------------------------------------------------------------
+  # IAM Roles
+  # ---------------------------------------------------------------------------
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-eventbridge-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartStateMachine
+          PolicyDocument:
+            Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - rekognition:DetectLabels
-                Resource: '*'
-  PublishToTopicFunction:
-    Type: AWS::Serverless::Function 
-    Properties:
-      CodeUri: publish_to_topic/
-      Handler: app.lambda_handler
-      Runtime: python3.7
-      Policies:
-          - AWSLambdaExecute # Managed Policy
-          - AWSIoTDataAccess # Managed Policy
-  UpdateShadowFunction:
-    Type: AWS::Serverless::Function 
-    Properties:
-      CodeUri: update_shadow/
-      Handler: app.lambda_handler
-      Runtime: python3.7
-      Policies:
-          - AWSLambdaExecute # Managed Policy
-          - AWSIoTDataAccess # Managed Policy
-  GeneratePresignedUrlFunction:
-    Type: AWS::Serverless::Function 
-    Properties:
-      CodeUri: generate_presigned_url/
-      Handler: app.lambda_handler
-      Runtime: python3.7
-      Policies:
-          - AWSLambdaExecute # Managed Policy
-          - AmazonS3FullAccess # Managed Policy
-  EventBridgeRole:
-    Type: AWS::IAM::Role
-    Properties : 
-      AssumeRolePolicyDocument: 
-        Version: "2012-10-17"
-        Statement: 
-          - 
-            Effect: "Allow"
-            Principal: 
-              Service: 
-                - "events.amazonaws.com"
-            Action: 
-              - "sts:AssumeRole"
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AdministratorAccess
+                  - states:StartExecution
+                Resource: !Ref RekognitionStateMachine
+
   ProcessImageRole:
     Type: AWS::IAM::Role
-    Properties : 
-      AssumeRolePolicyDocument: 
-        Version: "2012-10-17"
-        Statement: 
-          - 
-            Effect: "Allow"
-            Principal: 
-              Service: 
-                - "states.amazonaws.com"
-            Action: 
-              - "sts:AssumeRole"
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-statemachine-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
       Policies:
-        - 
-          PolicyName: !Sub '${AWS::StackName}-lambda'
+        - PolicyName: InvokeLambda
           PolicyDocument:
-              Version: '2012-10-17'
-              Statement:
-                  - 
-                    Effect: Allow
-                    Action:
-                        - lambda:InvokeFunction
-                    Resource:
-                        - !GetAtt DetectLabelsFunction.Arn
-                        - !GetAtt PublishToTopicFunction.Arn
-                        - !GetAtt GeneratePresignedUrlFunction.Arn
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt DetectLabelsFunction.Arn
+                  - !GetAtt PublishToTopicFunction.Arn
+                  - !GetAtt GeneratePresignedUrlFunction.Arn
+                  - !GetAtt UpdateShadowFunction.Arn
+        - PolicyName: XRayAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+
+  # ---------------------------------------------------------------------------
+  # Step Functions State Machine
+  # ---------------------------------------------------------------------------
   RekognitionStateMachine:
     Type: AWS::StepFunctions::StateMachine
-    Properties: 
+    Properties:
+      StateMachineName: !Sub '${AWS::StackName}-state-machine'
+      TracingConfiguration:
+        Enabled: !If [EnableXRayCondition, true, false]
+      RoleArn: !GetAtt ProcessImageRole.Arn
       DefinitionString: !Sub |
         {
-          "Comment": "An example of the Amazon States Language using a choice state.",
+          "Comment": "Process uploaded images for object detection",
           "StartAt": "DetectLabels",
           "States": {
             "DetectLabels": {
               "Type": "Task",
               "Resource": "${DetectLabelsFunction.Arn}",
               "ResultPath": "$",
-              "Next": "GeneratePresignedUrl"
+              "Next": "CheckDetection",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "HandleError"
+                }
+              ]
             },
-
+            "CheckDetection": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.detection_count",
+                  "NumericGreaterThan": 0,
+                  "Next": "GeneratePresignedUrl"
+                }
+              ],
+              "Default": "GeneratePresignedUrl"
+            },
             "GeneratePresignedUrl": {
               "Type": "Task",
               "Resource": "${GeneratePresignedUrlFunction.Arn}",
-              "ResultPath": "$.GeneratePresignedUrl",
-              "Next": "PublishToTopic"
+              "ResultPath": "$.presigned_url_result",
+              "Next": "PublishToTopic",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ]
             },
-
             "PublishToTopic": {
               "Type": "Task",
               "Resource": "${PublishToTopicFunction.Arn}",
+              "Next": "UpdateShadow",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ]
+            },
+            "UpdateShadow": {
+              "Type": "Task",
+              "Resource": "${UpdateShadowFunction.Arn}",
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 1,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ]
+            },
+            "HandleError": {
+              "Type": "Pass",
+              "Result": {
+                "status": "error",
+                "message": "Pipeline execution failed"
+              },
               "End": true
             }
           }
         }
-      RoleArn: !GetAtt ProcessImageRole.Arn
-      StateMachineName: RekognitionStateMachine
+      Tags:
+        - Key: Project
+          Value: cv-at-edge
+        - Key: Environment
+          Value: !Ref Environment
 
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Groups
+  # ---------------------------------------------------------------------------
+  DetectLabelsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DetectLabelsFunction}'
+      RetentionInDays: !Ref RetentionDays
+
+  PublishToTopicLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${PublishToTopicFunction}'
+      RetentionInDays: !Ref RetentionDays
+
+  UpdateShadowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${UpdateShadowFunction}'
+      RetentionInDays: !Ref RetentionDays
+
+  GeneratePresignedUrlLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${GeneratePresignedUrlFunction}'
+      RetentionInDays: !Ref RetentionDays
+
+# =============================================================================
+# Outputs
+# =============================================================================
 Outputs:
-  DetectLabelsFunction:
-    Description: "Detect Labels Lambda Function ARN"
+  ImageBucketName:
+    Description: S3 bucket for image uploads
+    Value: !Ref ImageBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageBucket'
+
+  ImageBucketArn:
+    Description: S3 bucket ARN
+    Value: !GetAtt ImageBucket.Arn
+
+  DetectLabelsFunctionArn:
+    Description: Detect Labels Lambda Function ARN
     Value: !GetAtt DetectLabelsFunction.Arn
-  PublishToTopicFunction:
-    Description: "Publish To Topic Lambda Function ARN"
+
+  PublishToTopicFunctionArn:
+    Description: Publish To Topic Lambda Function ARN
     Value: !GetAtt PublishToTopicFunction.Arn
-  GeneratePresignedUrlFunction:
-    Description: "Generate Presigned Url Lambda Function ARN"
+
+  GeneratePresignedUrlFunctionArn:
+    Description: Generate Presigned URL Lambda Function ARN
     Value: !GetAtt GeneratePresignedUrlFunction.Arn
-  UpdateShadowFunction:
-    Description: "Update Shadow Lambda Function ARN"
+
+  UpdateShadowFunctionArn:
+    Description: Update Shadow Lambda Function ARN
     Value: !GetAtt UpdateShadowFunction.Arn
-    
+
+  StateMachineArn:
+    Description: Step Functions State Machine ARN
+    Value: !Ref RekognitionStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachine'
+
+  IoTTopic:
+    Description: IoT topic for detection results
+    Value: !Ref IoTTopic
